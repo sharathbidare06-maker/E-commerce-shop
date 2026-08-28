@@ -1,0 +1,130 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  ACR_NAME: ecommerceacr
+  AKS_CLUSTER: ecommerce-aks
+  AKS_RESOURCE_GROUP: ecommerce-rg
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [user-service, product-service, cart-service, order-service, payment-service, notification-service, api-gateway, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        if: ${{ matrix.service != 'frontend' }}
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Node
+        if: ${{ matrix.service == 'frontend' }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Cache Maven dependencies
+        if: ${{ matrix.service != 'frontend' }}
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+
+      - name: Run Unit Tests
+        if: ${{ matrix.service != 'frontend' }}
+        run: |
+          cd ecommerce-${{ matrix.service }}
+          mvn clean test
+
+      - name: SonarQube Scan
+        if: ${{ matrix.service != 'frontend' }}
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Build Application
+        run: |
+          cd ecommerce-${{ matrix.service }}
+          if [ "${{ matrix.service }}" = "frontend" ]; then
+            npm ci && npm run build
+          else
+            mvn clean package -DskipTests
+          fi
+
+      - name: Build Docker Image
+        run: |
+          cd ecommerce-${{ matrix.service }}
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ github.sha }} .
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  push-and-deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build and Push Images
+        run: |
+          for service in user-service product-service cart-service order-service payment-service notification-service api-gateway frontend; do
+            cd ecommerce-$service
+            if [ "$service" = "frontend" ]; then
+              docker build -t ${{ env.ACR_NAME }}.azurecr.io/$service:${{ github.sha }} .
+            else
+              mvn clean package -DskipTests
+              docker build -t ${{ env.ACR_NAME }}.azurecr.io/$service:${{ github.sha }} .
+            fi
+            docker push ${{ env.ACR_NAME }}.azurecr.io/$service:${{ github.sha }}
+            cd ..
+          done
+
+      - name: Update GitOps Repo
+        run: |
+          git clone https://github.com/your-org/ecommerce-gitops.git
+          cd ecommerce-gitops
+          find . -name "*.yaml" -exec sed -i "s|image: .*|image: ${{ env.ACR_NAME }}.azurecr.io/\1:${{ github.sha }}|g" {} \;
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Update images to ${{ github.sha }}"
+          git push
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Deploy to AKS
+        run: |
+          az aks get-credentials --resource-group ${{ env.AKS_RESOURCE_GROUP }} --name ${{ env.AKS_CLUSTER }}
+          kubectl apply -k ecommerce-kubernetes/base/
