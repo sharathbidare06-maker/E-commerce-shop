@@ -1,0 +1,53 @@
+# Global values
+global:
+  environment: production
+  imageRegistry: "ecommerceacr.azurecr.io"
+  imageTag: "latest"
+  pullPolicy: IfNotPresent
+
+# Service configurations
+services:
+  userService:
+    replicas: 2
+    port: 8081
+    dbName: userdb
+  productService:
+    replicas: 2
+    port: 8082
+    dbName: productdb
+  cartService:
+    replicas: 2
+    port: 8083
+    dbName: cartdb
+  orderService:
+    replicas: 2
+    port: 8084
+    dbName: orderdb
+  paymentService:
+    replicas: 2
+    port: 8085
+    dbName: paymentdb
+  notificationService:
+    replicas: 2
+    port: 8086
+    dbName: notificationdb
+  apiGateway:
+    replicas: 2
+    port: 8080
+
+# HPA settings
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Resource limits
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "250m"
+  limits:
+    memory: "512Mi"
+    cpu: "500m"
